@@ -25,6 +25,13 @@ from diffusers.models.embeddings import SinusoidalPositionalEmbedding
 from diffusers.models.lora import LoRACompatibleLinear
 from diffusers.models.normalization import AdaLayerNorm, AdaLayerNormContinuous, AdaLayerNormZero, RMSNorm
 
+def zero_module(module):
+    """
+    Zero out the parameters of a module and return it.
+    """
+    for p in module.parameters():
+        p.detach().zero_()
+    return module
 
 def _chunked_feed_forward(
     ff: nn.Module, hidden_states: torch.Tensor, chunk_dim: int, chunk_size: int, lora_scale: Optional[float] = None
@@ -212,7 +219,7 @@ class BasicTransformerBlock(nn.Module):
             out_bias=attention_out_bias,
         )
 
-        # 2. Cross-Attn
+        # 2.1. Cross-Attn for image embeds
         if cross_attention_dim is not None or double_self_attention:
             # We currently only use AdaLayerNormZero for self attention where there will only be one attention block.
             # I.e. the number of returned modulation chunks from AdaLayerZero would not make sense if returned during
@@ -230,7 +237,7 @@ class BasicTransformerBlock(nn.Module):
                 )
             else:
                 self.norm2 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
-
+            # print(f"self.attn2: query_dim={dim}, cross_attention_dim={cross_attention_dim if not double_self_attention else None}, ")
             self.attn2 = Attention(
                 query_dim=dim,
                 cross_attention_dim=cross_attention_dim if not double_self_attention else None,
@@ -244,6 +251,40 @@ class BasicTransformerBlock(nn.Module):
         else:
             self.norm2 = None
             self.attn2 = None
+
+        # 2.2. Cross-Attn for text embeds
+        if cross_attention_dim is not None or double_self_attention:
+            # We currently only use AdaLayerNormZero for self attention where there will only be one attention block.
+            # I.e. the number of returned modulation chunks from AdaLayerZero would not make sense if returned during
+            # the second cross attention block.
+            if norm_type == "ada_norm":
+                self.norm2t = AdaLayerNorm(dim, num_embeds_ada_norm)
+            elif norm_type == "ada_norm_continuous":
+                self.norm2t = AdaLayerNormContinuous(
+                    dim,
+                    ada_norm_continous_conditioning_embedding_dim,
+                    norm_elementwise_affine,
+                    norm_eps,
+                    ada_norm_bias,
+                    "rms_norm",
+                )
+            else:
+                self.norm2 = nn.LayerNorm(dim, norm_eps, norm_elementwise_affine)
+
+            self.attn2t = Attention(
+                query_dim=dim,
+                cross_attention_dim=cross_attention_dim if not double_self_attention else None,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+                dropout=dropout,
+                bias=attention_bias,
+                upcast_attention=upcast_attention,
+                out_bias=attention_out_bias,
+            )  # is self-attn if encoder_hidden_states is none
+            self.attn2t.to_out = zero_module(self.attn2t.to_out)
+        else:
+            self.norm2t = None
+            self.attn2t = None
 
         # 3. Feed-forward
         if norm_type == "ada_norm_continuous":
@@ -332,6 +373,7 @@ class BasicTransformerBlock(nn.Module):
         cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
         gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
+        assert self.only_cross_attention is False
         attn_output = self.attn1(
             norm_hidden_states,
             encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
@@ -375,6 +417,29 @@ class BasicTransformerBlock(nn.Module):
                 attention_mask=encoder_attention_mask,
                 **cross_attention_kwargs,
             )
+            if self.attn2t is not None:
+                if self.norm_type == "ada_norm":
+                    norm_hidden_states = self.norm2t(hidden_states, timestep)
+                elif self.norm_type in ["ada_norm_zero", "layer_norm", "layer_norm_i2vgen"]:
+                    norm_hidden_states = self.norm2t(hidden_states)
+                elif self.norm_type == "ada_norm_single":
+                    # For PixArt norm2 isn't applied here:
+                    # https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L70C1-L76C103
+                    norm_hidden_states = hidden_states
+                elif self.norm_type == "ada_norm_continuous":
+                    norm_hidden_states = self.norm2t(hidden_states, added_cond_kwargs["pooled_text_emb"])
+                else:
+                    raise ValueError("Incorrect norm")
+
+
+                attn_output_text = self.attn2t(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    **cross_attention_kwargs,
+                )
+                attn_output = attn_output + attn_output_text
+
             hidden_states = attn_output + hidden_states
 
         # 4. Feed-forward
@@ -454,7 +519,7 @@ class TemporalBasicTransformerBlock(nn.Module):
             cross_attention_dim=None,
         )
 
-        # 2. Cross-Attn
+        # 2.1. Cross-Attn for image embeds
         if cross_attention_dim is not None:
             # We currently only use AdaLayerNormZero for self attention where there will only be one attention block.
             # I.e. the number of returned modulation chunks from AdaLayerZero would not make sense if returned during
@@ -469,6 +534,20 @@ class TemporalBasicTransformerBlock(nn.Module):
         else:
             self.norm2 = None
             self.attn2 = None
+
+        # 2.2. Cross-Attn for text embeds
+        if cross_attention_dim is not None:
+            self.norm2t = nn.LayerNorm(time_mix_inner_dim)
+            self.attn2t = Attention(
+                query_dim=time_mix_inner_dim,
+                cross_attention_dim=cross_attention_dim,
+                heads=num_attention_heads,
+                dim_head=attention_head_dim,
+            )  # is self-attn if encoder_hidden_states is none
+            self.attn2t.to_out = zero_module(self.attn2t.to_out)
+        else:
+            self.norm2t = None
+            self.attn2t = None
 
         # 3. Feed-forward
         self.norm3 = nn.LayerNorm(time_mix_inner_dim)
@@ -521,6 +600,12 @@ class TemporalBasicTransformerBlock(nn.Module):
             # print(f"norm_hidden_states shape: {norm_hidden_states.shape}")                                      # [18432, 25, 320]
             # print(f"encoder_hidden_states shape: {encoder_hidden_states.shape}")                                # [18432, 1, 1024]
             attn_output = self.attn2(norm_hidden_states, encoder_hidden_states=encoder_hidden_states)
+            if self.attn2t is not None:
+                norm_hidden_states = self.norm2t(hidden_states)                                                      # [18432, 25, 320]
+                # print(f"norm_hidden_states shape: {norm_hidden_states.shape}")                                      # [18432, 25, 320]
+                # print(f"encoder_hidden_states shape: {encoder_hidden_states.shape}")                                # [18432, 1, 1024]
+                attn_output_text = self.attn2t(norm_hidden_states, encoder_hidden_states=encoder_hidden_states)
+                attn_output = attn_output + attn_output_text
             hidden_states = attn_output + hidden_states
 
         # 4. Feed-forward
