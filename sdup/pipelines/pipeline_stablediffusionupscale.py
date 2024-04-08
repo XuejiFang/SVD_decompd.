@@ -14,7 +14,7 @@ from diffusers.image_processor import PipelineImageInput, VaeImageProcessor
 from diffusers.loaders import FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin
 from diffusers.models import AutoencoderKL
 import sys
-sys.path.insert(0, '/fangxueji/VideoPipeline')
+sys.path.insert(0, '/fangxueji/SVD_decompd.')
 from stablediffusionupscale.models.unet import UNet3DConditionModel
 from diffusers.models.attention_processor import (
     AttnProcessor2_0,
