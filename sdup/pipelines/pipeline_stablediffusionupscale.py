@@ -15,7 +15,7 @@ from diffusers.loaders import FromSingleFileMixin, LoraLoaderMixin, TextualInver
 from diffusers.models import AutoencoderKL
 import sys
 sys.path.insert(0, '/fangxueji/SVD_decompd.')
-from stablediffusionupscale.models.unet import UNet3DConditionModel
+from sdup.models.unet import UNet3DConditionModel
 from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     LoRAAttnProcessor2_0,
